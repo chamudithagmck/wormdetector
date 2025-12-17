@@ -40,66 +40,82 @@ for filename in os.listdir(IMAGE_DIR):
         print(f"Skipping {filename} (cannot read)")
         continue
 
-    original = img.copy()
-
     # ---------- PREPROCESS ----------
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 1. Mask the Microscope Circle (Remove Black Borders)
     h, w = gray.shape
+
+    # 1. Mask the Microscope Circle
     mask = np.zeros_like(gray)
-    # Draw a white circle in the center (slightly smaller than image) to define the "safe zone"
-    cv2.circle(mask, (w // 2, h // 2), min(w, h) // 2 - 30, 255, -1)
-    
-    # Apply mask: Everything outside the circle becomes black
+    cv2.circle(mask, (w // 2, h // 2), min(w, h) // 2 - 50, 255, -1)
     masked_gray = cv2.bitwise_and(gray, gray, mask=mask)
 
-    # ---------- ENHANCE WORMS (Blackhat) ----------
-    # Blackhat extracts "Dark objects on Light background"
-    # The worms are dark purple on light gray.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    blackhat = cv2.morphologyEx(masked_gray, cv2.MORPH_BLACKHAT, kernel)
+    # 2. Strong Contrast Enhancement (CLAHE)
+    # This helps faint worms stand out against the gray background
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(masked_gray)
 
-    # ---------- THRESHOLD ----------
-    # This makes the "enhanced" worms White and background Black
+    # 3. Adaptive Thresholding (More Sensitive)
+    # Block Size 21 (smaller than before) to catch thinner features
+    # C = 5 (higher constant) to reduce background noise
     thresh = cv2.adaptiveThreshold(
-        blackhat,
+        enhanced,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 
-        31,
-        -5
+        cv2.THRESH_BINARY_INV, # Inverted: Worms become WHITE, Background BLACK
+        21,
+        5
     )
 
-    # *** REMOVED bitwise_not HERE ***
-    # We want White Worms on Black Background for findContours.
+    # 4. Morphological Closing (Connect broken pieces)
+    # This connects parts of a worm if they are slightly separated
+    kernel_connect = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    connected = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_connect, iterations=2)
 
-    # ---------- CLEAN NOISE ----------
-    # Remove small white dots (purple stain noise)
-    # MORPH_OPEN removes small white noise
-    kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_clean, iterations=1)
-    
-    # Dilate slightly to connect broken parts of the worm
-    clean = cv2.dilate(clean, kernel_clean, iterations=2)
+    # 5. Remove Small Noise (Opening)
+    # Removes tiny dots without removing thin worms
+    kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    clean = cv2.morphologyEx(connected, cv2.MORPH_OPEN, kernel_clean, iterations=1)
 
     # ---------- FIND CONTOURS ----------
-    contours, _ = cv2.findContours(
-        clean,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
+    contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Filter by Area (Adjust this based on worm size)
-    # If worms are not detected, lower this number
-    min_area = 500 
-    worms = [c for c in contours if cv2.contourArea(c) > min_area]
+    valid_worms = []
+    
+    for c in contours:
+        area = cv2.contourArea(c)
+        
+        # FILTER 1: AREA
+        # Lowered to 100 to catch small/broken worm pieces
+        if area < 100: 
+            continue
+            
+        # FILTER 2: ELONGATION (The most important filter!)
+        # Worms are long. Dots are round.
+        if len(c) < 5: # Need enough points to fit an ellipse
+            continue
+            
+        # Fit an ellipse to get length and width
+        (x, y), (MA, ma), angle = cv2.fitEllipse(c)
+        
+        # Avoid division by zero
+        if MA == 0: continue
+            
+        # Aspect Ratio (Major Axis / Minor Axis)
+        # Round dots have ratio close to 1. Worms have high ratio.
+        aspect_ratio = ma / MA
+        
+        if aspect_ratio < 2.5: # If it's too round, it's a stain/dot. Skip it.
+            continue
+            
+        valid_worms.append(c)
 
-    print(f"{filename}: detected {len(worms)} worms")
+    # Sort largest to smallest and take top 15 (prevent noise explosion)
+    valid_worms = sorted(valid_worms, key=cv2.contourArea, reverse=True)[:15]
+
+    print(f"{filename}: detected {len(valid_worms)} worms")
 
     # ---------- EXTRACT COORDINATES ----------
-    for worm_id, worm in enumerate(worms, start=1):
-        # 4 Extreme Points
+    for worm_id, worm in enumerate(valid_worms, start=1):
         extLeft = tuple(worm[worm[:, :, 0].argmin()][0])
         extRight = tuple(worm[worm[:, :, 0].argmax()][0])
         extTop = tuple(worm[worm[:, :, 1].argmin()][0])
@@ -114,20 +130,15 @@ for filename in os.listdir(IMAGE_DIR):
             extBot[0], extBot[1]
         ])
 
-        # Draw green box
+        # Visualization
         x, y, w_box, h_box = cv2.boundingRect(worm)
         cv2.rectangle(img, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
-
-        # Draw red dots
         for p in [extLeft, extRight, extTop, extBot]:
-            cv2.circle(img, p, 5, (0, 0, 255), -1)
+            cv2.circle(img, p, 3, (0, 0, 255), -1)
 
     # ---------- SAVE ANNOTATED IMAGE ----------
     output_image_path = os.path.join(OUTPUT_DIR, filename)
     cv2.imwrite(output_image_path, img)
 
-# =========================
-# CLEANUP
-# =========================
 csv_file.close()
 print("Batch processing complete.")
