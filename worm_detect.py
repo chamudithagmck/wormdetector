@@ -2,13 +2,15 @@ import cv2
 import numpy as np
 import csv
 import os
+import math
 
 # =========================
-# PATHS
+# CONFIGURATION
 # =========================
 IMAGE_DIR = "images"
 OUTPUT_DIR = "output/annotated"
 CSV_PATH = "output/worm_coordinates.csv"
+TARGET_SIZE = 256
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -17,128 +19,112 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # =========================
 csv_file = open(CSV_PATH, "w", newline="")
 writer = csv.writer(csv_file)
-writer.writerow([
-    "image_name", "worm_id",
-    "left_x", "left_y",
-    "right_x", "right_y",
-    "top_x", "top_y",
-    "bottom_x", "bottom_y"
-])
+# Now we only save 2 coordinates: Start (x1,y1) and End (x2,y2)
+writer.writerow(["image_name", "worm_id", "end1_x", "end1_y", "end2_x", "end2_y"])
+
+# =========================
+# HELPER: Get 2 Endpoints
+# =========================
+def get_worm_endpoints(contour):
+    # Method: We find the two points in the contour that are farthest apart.
+    # This is computationally expensive for huge shapes, but perfect for small worms.
+    
+    # Reshape contour to simple list of points
+    pts = contour.reshape(-1, 2)
+    
+    max_dist = 0
+    p1, p2 = (0,0), (0,0)
+    
+    # To speed it up, we only check points on the Convex Hull (outer edge)
+    hull = cv2.convexHull(contour)
+    hull_pts = hull.reshape(-1, 2)
+    
+    # Brute-force distance check on hull points (reliable for finding ends)
+    for i in range(len(hull_pts)):
+        for j in range(i + 1, len(hull_pts)):
+            dist = np.linalg.norm(hull_pts[i] - hull_pts[j])
+            if dist > max_dist:
+                max_dist = dist
+                p1 = tuple(hull_pts[i])
+                p2 = tuple(hull_pts[j])
+                
+    return p1, p2
 
 # =========================
 # PROCESS EACH IMAGE
 # =========================
 for filename in os.listdir(IMAGE_DIR):
-
-    if not filename.lower().endswith((".jpg", ".jpeg")):
+    if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
         continue
 
     image_path = os.path.join(IMAGE_DIR, filename)
     img = cv2.imread(image_path)
+    if img is None: continue
 
-    if img is None:
-        print(f"Skipping {filename} (cannot read)")
-        continue
+    orig_h, orig_w = img.shape[:2]
 
-    # ---------- PREPROCESS ----------
+    # --- DETECTION LOGIC (Same as before) ---
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-
-    # 1. Mask the Microscope Circle
     mask = np.zeros_like(gray)
-    cv2.circle(mask, (w // 2, h // 2), min(w, h) // 2 - 50, 255, -1)
+    cv2.circle(mask, (orig_w // 2, orig_h // 2), min(orig_w, orig_h) // 2 - 40, 255, -1)
     masked_gray = cv2.bitwise_and(gray, gray, mask=mask)
 
-    # 2. Strong Contrast Enhancement (CLAHE)
-    # This helps faint worms stand out against the gray background
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(masked_gray)
 
-    # 3. Adaptive Thresholding (More Sensitive)
-    # Block Size 21 (smaller than before) to catch thinner features
-    # C = 5 (higher constant) to reduce background noise
-    thresh = cv2.adaptiveThreshold(
-        enhanced,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, # Inverted: Worms become WHITE, Background BLACK
-        21,
-        5
-    )
+    thresh = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 25, 5)
 
-    # 4. Morphological Closing (Connect broken pieces)
-    # This connects parts of a worm if they are slightly separated
     kernel_connect = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     connected = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_connect, iterations=2)
-
-    # 5. Remove Small Noise (Opening)
-    # Removes tiny dots without removing thin worms
+    
     kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
     clean = cv2.morphologyEx(connected, cv2.MORPH_OPEN, kernel_clean, iterations=1)
 
-    # ---------- FIND CONTOURS ----------
     contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     valid_worms = []
-    
     for c in contours:
-        area = cv2.contourArea(c)
-        
-        # FILTER 1: AREA
-        # Lowered to 100 to catch small/broken worm pieces
-        if area < 100: 
-            continue
-            
-        # FILTER 2: ELONGATION (The most important filter!)
-        # Worms are long. Dots are round.
-        if len(c) < 5: # Need enough points to fit an ellipse
-            continue
-            
-        # Fit an ellipse to get length and width
+        if cv2.contourArea(c) < 100: continue
+        if len(c) < 5: continue
         (x, y), (MA, ma), angle = cv2.fitEllipse(c)
-        
-        # Avoid division by zero
         if MA == 0: continue
-            
-        # Aspect Ratio (Major Axis / Minor Axis)
-        # Round dots have ratio close to 1. Worms have high ratio.
-        aspect_ratio = ma / MA
-        
-        if aspect_ratio < 2.5: # If it's too round, it's a stain/dot. Skip it.
-            continue
-            
+        if (ma / MA) < 2.0: continue
         valid_worms.append(c)
 
-    # Sort largest to smallest and take top 15 (prevent noise explosion)
     valid_worms = sorted(valid_worms, key=cv2.contourArea, reverse=True)[:15]
-
     print(f"{filename}: detected {len(valid_worms)} worms")
 
-    # ---------- EXTRACT COORDINATES ----------
-    for worm_id, worm in enumerate(valid_worms, start=1):
-        extLeft = tuple(worm[worm[:, :, 0].argmin()][0])
-        extRight = tuple(worm[worm[:, :, 0].argmax()][0])
-        extTop = tuple(worm[worm[:, :, 1].argmin()][0])
-        extBot = tuple(worm[worm[:, :, 1].argmax()][0])
+    # --- EXTRACT 2 ENDPOINTS ---
+    resized_img = cv2.resize(img, (TARGET_SIZE, TARGET_SIZE))
 
+    def scale_val(val, original_max, target_max):
+        return int((val / original_max) * target_max)
+
+    for worm_id, worm in enumerate(valid_worms, start=1):
+        # 1. Get the two farthest points on the worm (Head & Tail)
+        end1, end2 = get_worm_endpoints(worm)
+        
+        # 2. Scale them to 256x256
+        s_end1 = (scale_val(end1[0], orig_w, TARGET_SIZE), scale_val(end1[1], orig_h, TARGET_SIZE))
+        s_end2 = (scale_val(end2[0], orig_w, TARGET_SIZE), scale_val(end2[1], orig_h, TARGET_SIZE))
+
+        # 3. Save to CSV
         writer.writerow([
-            filename,
-            worm_id,
-            extLeft[0], extLeft[1],
-            extRight[0], extRight[1],
-            extTop[0], extTop[1],
-            extBot[0], extBot[1]
+            filename, worm_id,
+            s_end1[0], s_end1[1],
+            s_end2[0], s_end2[1]
         ])
 
-        # Visualization
-        x, y, w_box, h_box = cv2.boundingRect(worm)
-        cv2.rectangle(img, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
-        for p in [extLeft, extRight, extTop, extBot]:
-            cv2.circle(img, p, 3, (0, 0, 255), -1)
+        # 4. Draw Visuals
+        # Draw a line connecting the two ends (Visual check)
+        cv2.line(resized_img, s_end1, s_end2, (0, 255, 255), 1) 
+        # Draw Blue dots at the ends
+        cv2.circle(resized_img, s_end1, 3, (255, 0, 0), -1)
+        cv2.circle(resized_img, s_end2, 3, (255, 0, 0), -1)
 
-    # ---------- SAVE ANNOTATED IMAGE ----------
     output_image_path = os.path.join(OUTPUT_DIR, filename)
-    cv2.imwrite(output_image_path, img)
+    cv2.imwrite(output_image_path, resized_img)
 
 csv_file.close()
-print("Batch processing complete.")
+print("Done.")
