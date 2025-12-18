@@ -78,20 +78,24 @@ for filename in os.listdir(IMAGE_DIR):
     # 1. Convert to HSV (Best for color detection)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # 2. Define "Red" Color Range
-    # Red wraps around the spectrum (0-10 AND 170-180)
-    lower_red1 = np.array([0, 120, 70])
+    # 2. Define "Red" Color Range (Tuned strictly for #e3182c)
+    # The target is H=177, S=229, V=227.
+    # We raise the S and V minimums to 160 to ignore washed-out or dark noise.
+    
+    # Lower Red Spectrum (0-10)
+    lower_red1 = np.array([0, 160, 160])
     upper_red1 = np.array([10, 255, 255])
     
-    lower_red2 = np.array([170, 120, 70])
+    # Upper Red Spectrum (170-180) -> This catches your #e3182c (Hue 177)
+    lower_red2 = np.array([170, 160, 160])
     upper_red2 = np.array([180, 255, 255])
 
     # Create Masks
     mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
     mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask = mask1 + mask2 # Combine both red ranges
+    mask = mask1 + mask2 # Combine both ranges
 
-    # Clean noise (remove tiny red specks if any)
+    # Clean noise (remove single pixel specks)
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
@@ -100,7 +104,7 @@ for filename in os.listdir(IMAGE_DIR):
 
     detected_points = []
     for c in contours:
-        # Filter tiny noise
+        # Filter tiny noise (must be at least 5 pixels)
         if cv2.contourArea(c) < 5: continue
         
         # Get center of the dot
