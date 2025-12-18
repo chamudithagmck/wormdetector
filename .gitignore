@@ -1,3 +1,9 @@
 *.jpeg
 /images
 *.JPG
+*.csv
+output/worm_coordinates.csv
+*.csv
+*.csv
+*.csv
+detect_manual_dots.py
